@@ -44,6 +44,115 @@ This is a compact ESP32-C3 development board with integrated 0.42" OLED display.
 
 ---
 
+## Chip Hardware Details
+
+### Core Specifications
+
+| Property | Value |
+|----------|-------|
+| **Chip Model** | ESP32-C3 (QFN32) |
+| **Chip Revision** | v0.4 (tested) |
+| **CPU Architecture** | RISC-V 32-bit single-core |
+| **CPU Frequency** | 160 MHz (configurable to 80 MHz) |
+| **Clock Sources** | 40 MHz XTAL, 150 kHz RTC |
+| **APB Clock** | 80 MHz (peripheral bus) |
+
+### Features & Capabilities
+
+| Feature | Status | Details |
+|---------|--------|---------|
+| **WiFi** | ✅ YES | 802.11 b/g/n (2.4GHz) - verified |
+| **Bluetooth** | ✅ YES | Bluetooth 5.0 LE - verified |
+| **IEEE 802.15.4** | ⚠️ NO* | *Not detected in hardware test (may require config) |
+| **Embedded Flash** | ✅ YES | 4MB XMC SPI Flash - verified |
+
+*Note: IEEE 802.15.4 support exists in hardware but may not be enabled in current build configuration.*
+
+### Memory Configuration
+
+| Memory Type | Size | Details |
+|-------------|------|---------|XMC SPI Flash (embedded) |
+| **Internal RAM** | 400 KB | SRAM |
+| **Free Heap (boot)** | ~321 KB | After system initialization (tested)
+| **Free Heap (boot)** | ~280-300 KB | After system initialization |
+| **RTC Memory** | 8 KB | Preserved in deep sleep |
+
+### Partition Layout
+
+| Name | Type | SubType | Offset | Size | Usage |
+|------|------|---------|--------|------|-------|
+| **nvs** | data | nvs | 0x9000 | 24 KB | Non-volatile storage |
+| **phy_init** | data | phy | 0xf000 | 4 KB | PHY calibration data |
+| **factory** | app | factory | 0x10000 | 1 MB | Application firmware |
+
+**Available Space**: ~3 MB for custom partitions (data logging, SPIFFS, etc.)
+
+### Peripheral Inventory
+
+| Peripheral | Quantity | Pins/Details |
+|------------|----------|--------------|
+| **UART** | 2 | UART0 (GPIO20/21), UART1 (conflicts with USB) |
+| **I2C** | 1 | Any GPIO via software, hardware acceleration available |
+| **SPI** | 3 | SPI0/1 (flash), SPI2/FSPI (available) |
+| **GPIO Pins** | 22 | GPIO 0-21 |
+| **ADC Channels** | 6 | ADC1: GPIO0-4 (5 ch), ADC2: GPIO5 (1 ch) |
+| **ADC Resolution** | 12-bit | 0-4095 (0-3.3V with attenuation) |
+| **Timer Groups** | 2 | 1 timer per group |
+| **RMT Channels** | 4 | Remote control (IR, LED strips, etc.) |
+| **LEDC Channels** | 6 | PWM for LED dimming |
+| **USB Serial/JTAG** | 1 | Native USB-C (GPIO18/19) |
+
+### MAC Addresses
+
+The ESP32-C3 has unique MAC addresses for each interface:
+
+| Interface | MAC Address | Notes |
+|-----------|-------------|-------|
+| **WiFi Station** | `0C:4E:A0:63:20:C8` | Tested 2026-01-02 |
+| **WiFi SoftAP** | `0C:4E:A0:63:20:C9` | Base MAC + 1 |
+| **Bluetooth** | `0C:4E:A0:63:20:CA` | Base MAC + 2 |
+| **Ethernet** | `0C:4E:A0:63:20:CB` | Placeholder (no Ethernet hardware) |
+
+*Hardware info test confirmed these values on 2026-01-02.*
+
+### ADC Specifications
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| **Resolution** | 12-bit (0-4095) | |
+| **Voltage Range** | 0 - 3.3V | With 11dB attenuation |
+| **ADC1 Channels** | 5 | GPIO 0-4 |
+| **ADC2 Channels** | 1 | GPIO 5 |
+
+#### ADC Attenuation Ranges
+
+| Attenuation | Voltage Range | Typical Use |
+|-------------|---------------|-------------|
+| **0 dB** | 0 - 950 mV | Low voltage sensing |
+| **2.5 dB** | 0 - 1250 mV | |
+| **6 dB** | 0 - 1750 mV | |
+| **11 dB** | 0 - 3100 mV | Battery monitoring (3.3V systems) |
+
+**Note**: GPIO5 (ADC2_CH0) is shared with I2C and conflicts with WiFi. Use ADC1 channels (GPIO0-4) for reliable readings.
+
+### Boot Modes
+
+| GPIO9 (BOOT) | GPIO8 | GPIO2 | Mode |
+|--------------|-------|-------|------|
+| 0 (LOW) | X | X | **Download mode** (UART/USB flash) |
+| 1 (HIGH) | X | X | **Normal boot** (run firmware) |
+
+**Note**: GPIO9 has onboard pull-up and BOOT button. Hold button during reset to enter download mode.
+
+### Temperature Range
+
+| Parameter | Value |
+|-----------|-------|
+| **Operating** | -40°C to +85°C |
+| **Storage** | -40°C to +125°C |
+
+---
+
 ## Pinout Diagram
 
 ```
