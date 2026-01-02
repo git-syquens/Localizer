@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cmake --version:*)",
+      "Bash(where cmake:*)",
+      "Bash(where:*)"
+    ]
+  }
+}
