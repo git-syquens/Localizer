@@ -40,8 +40,8 @@
 // GPS CONFIGURATION (GY-GPS6MV2 / NEO-6M)
 // ============================================================================
 #define GPS_UART_NUM            UART_NUM_1
-#define GPS_TX_PIN              2   // ESP32-C3 TX → GPS RX (GPIO2)
-#define GPS_RX_PIN              3   // ESP32-C3 RX ← GPS TX (GPIO3)
+#define GPS_TX_PIN              21   // ESP32-C3 TX → GPS RX (board's TX pin)
+#define GPS_RX_PIN              20   // ESP32-C3 RX ← GPS TX (board's RX pin)
 #define GPS_BAUD_RATE           9600
 #define GPS_BUFFER_SIZE         1024
 #define GPS_FIX_TIMEOUT_MS      60000  // 60 seconds for initial fix
@@ -76,16 +76,17 @@
 // ============================================================================
 // MQTT CONFIGURATION
 // ============================================================================
-#define MQTT_BROKER_URI         "mqtts://mqtt.syquens.com:8883"
+// MQTT credentials - externalized to mqtt_credentials.h (excluded from git)
+#include "mqtt_credentials.h"
 #define MQTT_CLIENT_ID_PREFIX   "localizer_"
 #define MQTT_KEEPALIVE_SEC      60
 #define MQTT_RECONNECT_MS       5000
 
-// Default MQTT credentials (can be overridden via NVS)
-#define DEFAULT_MQTT_BROKER     "mqtt.syquens.com"
+// Default MQTT credentials from mqtt_credentials.h (can be overridden via NVS)
+#define DEFAULT_MQTT_BROKER     MQTT_BROKER_URI
 #define DEFAULT_MQTT_PORT       8883
-#define DEFAULT_MQTT_USER       "camper_device"
-#define DEFAULT_MQTT_PASS       "your_mqtt_password"
+#define DEFAULT_MQTT_USER       MQTT_USER
+#define DEFAULT_MQTT_PASS       MQTT_PASSWORD
 
 // MQTT Topics
 #define MQTT_TOPIC_BASE         "camper"

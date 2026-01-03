@@ -33,6 +33,7 @@
 #include "esp_sntp.h"
 #include "esp_http_client.h"
 #include "mqtt_client.h"
+#include "esp_crt_bundle.h"
 #include "nvs_flash.h"
 #include "cJSON.h"
 #include "config.h"
@@ -57,6 +58,8 @@ typedef struct {
     bool fix_valid;
     float latitude;
     float longitude;
+    float altitude;
+    float hdop;
     int satellites;
     int hour;
     int minute;
@@ -65,6 +68,7 @@ typedef struct {
     int month;
     int year;
     float speed_knots;
+    char fix_type;  // 0=no fix, 1=GPS, 2=DGPS
 } gps_data_t;
 
 static gps_data_t gps_data = {0};
@@ -399,16 +403,25 @@ static void parse_gpgga(const char *sentence) {
         ptr = strtok(NULL, ",");
     }
     
-    if (count < 8) return;
+    if (count < 10) return;
+    
+    // Get fix quality (0=no fix, 1=GPS, 2=DGPS)
+    gps_data.fix_type = atoi(tokens[6]);
     
     // Get satellite count
     gps_data.satellites = atoi(tokens[7]);
+    
+    // Get HDOP (horizontal dilution of precision)
+    gps_data.hdop = atof(tokens[8]);
+    
+    // Get altitude
+    gps_data.altitude = atof(tokens[9]);
 }
 
 static void parse_nmea_sentence(const char *sentence) {
-    if (strncmp(sentence, "$GPRMC", 6) == 0) {
+    if (strncmp(sentence, "$GPRMC", 6) == 0 || strncmp(sentence, "$GNRMC", 6) == 0) {
         parse_gprmc(sentence);
-    } else if (strncmp(sentence, "$GPGGA", 6) == 0) {
+    } else if (strncmp(sentence, "$GPGGA", 6) == 0 || strncmp(sentence, "$GNGGA", 6) == 0) {
         parse_gpgga(sentence);
     }
 }
@@ -716,11 +729,12 @@ static void serial_load_settings(void) {
         ESP_LOGI(TAG, "Corrupted MQTT broker detected, reset to default");
     }
     
-    len = sizeof(config_mqtt_user);
-    nvs_get_str(nvs_handle, "mqtt_user", config_mqtt_user, &len);
+    // MQTT credentials now come from mqtt_credentials.h, not NVS
+    // len = sizeof(config_mqtt_user);
+    // nvs_get_str(nvs_handle, "mqtt_user", config_mqtt_user, &len);
     
-    len = sizeof(config_mqtt_pass);
-    nvs_get_str(nvs_handle, "mqtt_pass", config_mqtt_pass, &len);
+    // len = sizeof(config_mqtt_pass);
+    // nvs_get_str(nvs_handle, "mqtt_pass", config_mqtt_pass, &len);
     
     uint8_t temp;
     if (nvs_get_u8(nvs_handle, "rtc_sync_src", &temp) == ESP_OK) {
@@ -810,6 +824,7 @@ static void serial_menu_task(void *pvParameters) {
 static void mqtt_init(void) {
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = config_mqtt_broker,
+        .broker.verification.crt_bundle_attach = esp_crt_bundle_attach,
         .credentials.username = config_mqtt_user,
         .credentials.authentication.password = config_mqtt_pass,
     };
@@ -954,6 +969,7 @@ static void gps_task(void *pvParameters) {
     char line_buffer[256];
     int line_pos = 0;
     bool gps_time_synced = false;
+    uint32_t last_status_print = 0;
     
     while (1) {
         uint8_t data;
@@ -965,13 +981,32 @@ static void gps_task(void *pvParameters) {
                 if (line_pos > 0 && line_buffer[0] == '$') {
                     parse_nmea_sentence(line_buffer);
                     
-                    // Debug output if enabled
-                    if (gps_debug_enabled && gps_data.fix_valid) {
-                        printf("[GPS] Lat: %.6f, Lon: %.6f, Sats: %d, Time: %02d:%02d:%02d, Speed: %.1f kts\n",
-                               gps_data.latitude, gps_data.longitude, gps_data.satellites,
-                               gps_data.hour, gps_data.minute, gps_data.second, gps_data.speed_knots);
-                        printf("[LOC] Street: %s, City: %s, Country: %s\n",
-                               location_street, location_city, location_country);
+                    // Print GPS status once per second
+                    uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+                    if (now - last_status_print >= 1000) {
+                        last_status_print = now;
+                        
+                        // WiFi status
+                        const char *wifi_status = (xEventGroupGetBits(s_event_group) & WIFI_CONNECTED_BIT) ? "WIFI:OK" : "WIFI:--";
+                        
+                        // GPS fix status
+                        if (gps_data.fix_valid) {
+                            printf("GPS: FIX | Sats:%d | Lat:%.6f Lon:%.6f | Time:%02d:%02d:%02d | %s | %s, %s, %s\n",
+                                   gps_data.satellites,
+                                   gps_data.latitude,
+                                   gps_data.longitude,
+                                   gps_data.hour,
+                                   gps_data.minute,
+                                   gps_data.second,
+                                   wifi_status,
+                                   location_street[0] ? location_street : "---",
+                                   location_city[0] ? location_city : "---",
+                                   location_country[0] ? location_country : "--");
+                        } else {
+                            printf("GPS: Searching... | Sats:%d | %s\n", 
+                                   gps_data.satellites,
+                                   wifi_status);
+                        }
                     }
                     
                     // Sync RTC from GPS when first fix is acquired (if GPS sync is selected)

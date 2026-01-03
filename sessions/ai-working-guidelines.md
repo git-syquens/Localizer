@@ -6,6 +6,30 @@ This document provides efficient working patterns specific to the Localizer ESP3
 
 ---
 
+## Error Recovery Protocol
+
+**CRITICAL**: When you make a major error that breaks working functionality:
+
+1. **STOP** all automatic changes immediately
+2. **PROPOSE** the fix/next action and explain what you plan to do
+3. **WAIT** for explicit user approval before executing
+4. Continue this cautious "propose-then-wait" pattern until user says "proceed as normal"
+
+**Examples of major errors:**
+- Changing working GPIO pin assignments
+- Modifying functioning UART configurations
+- Breaking established WiFi/MQTT connections
+- Reverting working fixes
+
+**Pattern:**
+```
+❌ Bad: "Changing GPIO2/3 to GPIO20/21..." [executes immediately]
+✅ Good: "I see the issue. Should I change GPS pins from GPIO2/3 back to GPIO20/21? This will require rebuilding and flashing."
+[waits for approval]
+```
+
+---
+
 ## Pre-Flight Checks
 
 Before making any changes:
