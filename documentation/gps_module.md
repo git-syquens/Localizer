@@ -4,7 +4,7 @@
 **Chipset**: u-blox NEO-6M  
 **Interface**: UART (Serial)  
 **Protocol**: NMEA 0183  
-**Last Updated**: 2026-01-03
+**Last Updated**: 2026-01-04
 
 ---
 
@@ -35,8 +35,8 @@ The GY-GPS6MV2 is a compact GPS module based on the u-blox NEO-6M chipset. It pr
 |----------------|--------------|----------|-------|
 | **VCC** | **3.3V** or **5V** | Power supply | 3.3V recommended (module has onboard regulator) |
 | **GND** | **GND** | Ground | Common ground |
-| **TX** | **GPIO20** (UART0_RX) | GPS transmit → ESP receive | NMEA data output from GPS |
-| **RX** | **GPIO21** (UART0_TX) | GPS receive ← ESP transmit | Commands to GPS (optional) |
+| **TX** | **GPIO20** (Board RX) | GPS transmit → ESP receive | NMEA data output from GPS |
+| **RX** | **GPIO21** (Board TX) | GPS receive ← ESP transmit | Commands to GPS (optional) |
 
 ### Connection Diagram
 
@@ -62,17 +62,19 @@ GY-GPS6MV2 Module          ESP32-C3 Board
 
 VCC  → 3.3V (or 5V if module has regulator)
 GND  → GND
-TX   → GPIO20 (UART0_RX) - GPS sends data to ESP
-RX   → GPIO21 (UART0_TX) - ESP sends commands to GPS (optional)
+TX   → GPIO20 (Board RX) - GPS sends data to ESP
+RX   → GPIO21 (Board TX) - ESP sends commands to GPS (optional)
 ```
 
 ### Important Notes
 
 1. **Power Supply**: The GY-GPS6MV2 typically has an onboard 3.3V regulator, so it can accept either 3.3V or 5V input. Using 3.3V is recommended to reduce heat and power consumption.
 
-2. **TX/RX Crossover**: GPS module's TX pin connects to ESP32's RX pin (GPIO20), and GPS RX connects to ESP32 TX (GPIO21). This is standard UART crossover wiring.
+2. **TX/RX Crossover**: GPS module's TX pin connects to ESP32's RX pin (GPIO20, board's labeled RX), and GPS RX connects to ESP32 TX (GPIO21, board's labeled TX). This is standard UART crossover wiring.
 
 3. **UART Configuration**: 
+   - Uses: UART1 (to avoid conflicts with USB-Serial console on UART0)
+   - GPIO Pins: GPIO20 (RX), GPIO21 (TX)
    - Baud Rate: 9600 bps (default)
    - Data Bits: 8
    - Parity: None
