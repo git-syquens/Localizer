@@ -4,6 +4,9 @@ sdkconfig
 sdkconfig.old
 *.pyc
 
+# WiFi Credentials (sensitive)
+main/wifi_credentials.h
+
 # IDE
 .vscode/
 .idea/

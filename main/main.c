@@ -1,58 +1,99 @@
+/**
+ * Localizer - GPS/RTC/WiFi/NTP/MQTT Tracker
+ * 
+ * ESP32-C3 with 0.42" OLED Display
+ * Syquens B.V. - 2026
+ * 
+ * Features:
+ * - GPS fix detection and time synchronization
+ * - RTC (DS3231) with GPS/NTP sync
+ * - WiFi connection management
+ * - NTP time service
+ * - MQTT telemetry publishing
+ * - Real-time location lookup
+ * - 5-line OLED status display
+ */
+
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
+#include <sys/time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/event_groups.h"
+#include "freertos/queue.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
+#include "driver/uart.h"
 #include "esp_log.h"
 #include "esp_system.h"
-#include "esp_chip_info.h"
-#include "esp_flash.h"
-#include "esp_mac.h"
-#include "esp_clk_tree.h"
-#include "soc/soc_caps.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "esp_sntp.h"
+#include "esp_http_client.h"
+#include "mqtt_client.h"
+#include "nvs_flash.h"
+#include "cJSON.h"
+#include "config.h"
 
-static const char *TAG = "OLED_TEST";
+static const char *TAG = "LOCALIZER";
 
-// I2C Configuration
-#define I2C_MASTER_SCL_IO           6      // GPIO6
-#define I2C_MASTER_SDA_IO           5      // GPIO5
-#define I2C_MASTER_FREQ_HZ          400000 // 400kHz
-#define I2C_MASTER_TIMEOUT_MS       1000
+// Event groups
+static EventGroupHandle_t s_event_group;
+#define WIFI_CONNECTED_BIT      BIT0
+#define GPS_FIX_BIT             BIT1
+#define RTC_SYNCED_BIT          BIT2
+#define NTP_SYNCED_BIT          BIT3
 
-// SSD1306 OLED Configuration
-#define OLED_I2C_ADDR               0x3C
-#define OLED_WIDTH                  128
-#define OLED_HEIGHT                 64
-#define OLED_VISIBLE_WIDTH          72
-#define OLED_VISIBLE_HEIGHT         40
-#define OLED_X_OFFSET               28     // Updated offset from board reference
-#define OLED_Y_OFFSET               24     // Updated offset from board reference
+// Global handles
+static i2c_master_bus_handle_t i2c_bus_handle = NULL;
+static i2c_master_dev_handle_t oled_dev_handle = NULL;
+static i2c_master_dev_handle_t rtc_dev_handle = NULL;
+static esp_mqtt_client_handle_t mqtt_client = NULL;
 
-// SSD1306 Commands
-#define OLED_CMD_DISPLAY_OFF        0xAE
-#define OLED_CMD_DISPLAY_ON         0xAF
-#define OLED_CMD_SET_CONTRAST       0x81
-#define OLED_CMD_SET_MUX_RATIO      0xA8
-#define OLED_CMD_SET_DISPLAY_OFFSET 0xD3
-#define OLED_CMD_SET_START_LINE     0x40
-#define OLED_CMD_SET_SEGMENT_REMAP  0xA1
-#define OLED_CMD_SET_COM_SCAN_DEC   0xC8
-#define OLED_CMD_SET_COM_PINS       0xDA
-#define OLED_CMD_SET_PRECHARGE      0xD9
-#define OLED_CMD_SET_VCOMH          0xDB
-#define OLED_CMD_CHARGE_PUMP        0x8D
-#define OLED_CMD_DEACTIVATE_SCROLL  0x2E
-#define OLED_CMD_MEMORY_MODE        0x20
-#define OLED_CMD_COLUMN_ADDR        0x21
-#define OLED_CMD_PAGE_ADDR          0x22
+// GPS data structure
+typedef struct {
+    bool fix_valid;
+    float latitude;
+    float longitude;
+    int satellites;
+    int hour;
+    int minute;
+    int second;
+    int day;
+    int month;
+    int year;
+    float speed_knots;
+} gps_data_t;
 
-static i2c_master_bus_handle_t i2c_bus_handle;
-static i2c_master_dev_handle_t oled_dev_handle;
+static gps_data_t gps_data = {0};
 
-// Simple 5x7 font (ASCII 32-127)
+// Location data
+static char location_street[128] = "Initializing...";
+static char location_city[64] = "";
+static char location_country[16] = "";
+
+// Display scroll positions
+static int scroll_pos_line4 = 0;
+static int scroll_pos_line5 = 0;
+
+// Configuration stored in NVS
+static char config_wifi_ssid[32] = DEFAULT_WIFI_SSID;
+static char config_wifi_pass[64] = DEFAULT_WIFI_PASS;
+static char config_mqtt_broker[128] = MQTT_BROKER_URI;
+static char config_mqtt_user[64] = DEFAULT_MQTT_USER;
+static char config_mqtt_pass[64] = DEFAULT_MQTT_PASS;
+static bool gps_debug_enabled = false;
+typedef enum {
+    RTC_SYNC_GPS = 0,
+    RTC_SYNC_NTP = 1
+} rtc_sync_source_t;
+static rtc_sync_source_t rtc_sync_source = RTC_SYNC_GPS;
+
+// 5x7 font for OLED display
 static const uint8_t font_5x7[][5] = {
-    {0x00, 0x00, 0x00, 0x00, 0x00}, // (space)
+    {0x00, 0x00, 0x00, 0x00, 0x00}, // space (32)
     {0x00, 0x00, 0x5F, 0x00, 0x00}, // !
     {0x00, 0x07, 0x00, 0x07, 0x00}, // "
     {0x14, 0x7F, 0x14, 0x7F, 0x14}, // #
@@ -116,146 +157,75 @@ static const uint8_t font_5x7[][5] = {
     {0x00, 0x41, 0x41, 0x7F, 0x00}, // ]
     {0x04, 0x02, 0x01, 0x02, 0x04}, // ^
     {0x40, 0x40, 0x40, 0x40, 0x40}, // _
-    {0x00, 0x01, 0x02, 0x04, 0x00}, // `
-    {0x20, 0x54, 0x54, 0x54, 0x78}, // a
-    {0x7F, 0x48, 0x44, 0x44, 0x38}, // b
-    {0x38, 0x44, 0x44, 0x44, 0x20}, // c
-    {0x38, 0x44, 0x44, 0x48, 0x7F}, // d
-    {0x38, 0x54, 0x54, 0x54, 0x18}, // e
-    {0x08, 0x7E, 0x09, 0x01, 0x02}, // f
-    {0x0C, 0x52, 0x52, 0x52, 0x3E}, // g
-    {0x7F, 0x08, 0x04, 0x04, 0x78}, // h
-    {0x00, 0x44, 0x7D, 0x40, 0x00}, // i
-    {0x20, 0x40, 0x44, 0x3D, 0x00}, // j
-    {0x7F, 0x10, 0x28, 0x44, 0x00}, // k
-    {0x00, 0x41, 0x7F, 0x40, 0x00}, // l
-    {0x7C, 0x04, 0x18, 0x04, 0x78}, // m
-    {0x7C, 0x08, 0x04, 0x04, 0x78}, // n
-    {0x38, 0x44, 0x44, 0x44, 0x38}, // o
-    {0x7C, 0x14, 0x14, 0x14, 0x08}, // p
-    {0x08, 0x14, 0x14, 0x18, 0x7C}, // q
-    {0x7C, 0x08, 0x04, 0x04, 0x08}, // r
-    {0x48, 0x54, 0x54, 0x54, 0x20}, // s
-    {0x04, 0x3F, 0x44, 0x40, 0x20}, // t
-    {0x3C, 0x40, 0x40, 0x20, 0x7C}, // u
-    {0x1C, 0x20, 0x40, 0x20, 0x1C}, // v
-    {0x3C, 0x40, 0x30, 0x40, 0x3C}, // w
-    {0x44, 0x28, 0x10, 0x28, 0x44}, // x
-    {0x0C, 0x50, 0x50, 0x50, 0x3C}, // y
-    {0x44, 0x64, 0x54, 0x4C, 0x44}, // z
 };
 
-static uint8_t framebuffer[OLED_WIDTH * OLED_HEIGHT / 8] = {0};
+// OLED frame buffer (72x40 pixels = 72*5 bytes)
+static uint8_t oled_buffer[72 * 5] = {0};
 
-esp_err_t oled_write_command(uint8_t cmd)
-{
-    uint8_t data[2] = {0x00, cmd}; // Control byte (0x00 = command)
-    return i2c_master_transmit(oled_dev_handle, data, 2, I2C_MASTER_TIMEOUT_MS);
+// ============================================================================
+// OLED Display Functions (SSD1306 - 72x40)
+// ============================================================================
+
+#define OLED_PAGES  5
+
+static void oled_write_command(uint8_t cmd) {
+    uint8_t data[2] = {0x00, cmd};
+    i2c_master_transmit(oled_dev_handle, data, 2, 1000);
 }
 
-esp_err_t oled_write_data(uint8_t *data, size_t len)
-{
-    uint8_t buffer[len + 1];
-    buffer[0] = 0x40; // Control byte (0x40 = data)
-    memcpy(buffer + 1, data, len);
-    return i2c_master_transmit(oled_dev_handle, buffer, len + 1, I2C_MASTER_TIMEOUT_MS);
+static void oled_init(void) {
+    vTaskDelay(pdMS_TO_TICKS(100));
+    
+    oled_write_command(0xAE); // Display off
+    oled_write_command(0xD5); // Set display clock
+    oled_write_command(0x80);
+    oled_write_command(0xA8); // Set multiplex
+    oled_write_command(0x27); // 40 rows
+    oled_write_command(0xD3); // Set display offset
+    oled_write_command(0x00);
+    oled_write_command(0x40); // Set start line
+    oled_write_command(0x8D); // Charge pump
+    oled_write_command(0x14);
+    oled_write_command(0x20); // Memory mode
+    oled_write_command(0x00); // Horizontal
+    oled_write_command(0xA1); // Segment remap
+    oled_write_command(0xC8); // COM scan direction
+    oled_write_command(0xDA); // COM pins
+    oled_write_command(0x12);
+    oled_write_command(0x81); // Contrast
+    oled_write_command(0xCF);
+    oled_write_command(0xD9); // Precharge
+    oled_write_command(0xF1);
+    oled_write_command(0xDB); // VCOM detect
+    oled_write_command(0x40);
+    oled_write_command(0xA4); // Resume display
+    oled_write_command(0xA6); // Normal display
+    oled_write_command(0xAF); // Display on
+    
+    ESP_LOGI(TAG, "OLED initialized");
 }
 
-esp_err_t oled_init(void)
-{
-    esp_err_t ret;
-    
-    // Initialization sequence
-    ret = oled_write_command(OLED_CMD_DISPLAY_OFF);
-    if (ret != ESP_OK) return ret;
-    
-    ret = oled_write_command(OLED_CMD_SET_MUX_RATIO);
-    if (ret != ESP_OK) return ret;
-    ret = oled_write_command(0x3F); // 64 lines
-    if (ret != ESP_OK) return ret;
-    
-    ret = oled_write_command(OLED_CMD_SET_DISPLAY_OFFSET);
-    if (ret != ESP_OK) return ret;
-    ret = oled_write_command(0x00); // No offset
-    if (ret != ESP_OK) return ret;
-    
-    ret = oled_write_command(OLED_CMD_SET_START_LINE | 0x00);
-    if (ret != ESP_OK) return ret;
-    
-    ret = oled_write_command(OLED_CMD_SET_SEGMENT_REMAP); // Column 127 mapped to SEG0
-    if (ret != ESP_OK) return ret;
-    
-    ret = oled_write_command(OLED_CMD_SET_COM_SCAN_DEC); // Scan from COM[N-1] to COM0
-    if (ret != ESP_OK) return ret;
-    
-    ret = oled_write_command(OLED_CMD_SET_COM_PINS);
-    if (ret != ESP_OK) return ret;
-    ret = oled_write_command(0x12); // Alternative COM pin config
-    if (ret != ESP_OK) return ret;
-    
-    ret = oled_write_command(OLED_CMD_SET_CONTRAST);
-    if (ret != ESP_OK) return ret;
-    ret = oled_write_command(0xFF); // Maximum brightness
-    if (ret != ESP_OK) return ret;
-    
-    ret = oled_write_command(0xA4); // Display follows RAM content
-    if (ret != ESP_OK) return ret;
-    
-    ret = oled_write_command(0xA6); // Normal display (not inverted)
-    if (ret != ESP_OK) return ret;
-    
-    ret = oled_write_command(OLED_CMD_SET_PRECHARGE);
-    if (ret != ESP_OK) return ret;
-    ret = oled_write_command(0xF1); // Phase 1: 1 DCLK, Phase 2: 15 DCLK
-    if (ret != ESP_OK) return ret;
-    
-    ret = oled_write_command(OLED_CMD_SET_VCOMH);
-    if (ret != ESP_OK) return ret;
-    ret = oled_write_command(0x40); // VCOMH deselect level
-    if (ret != ESP_OK) return ret;
-    
-    ret = oled_write_command(OLED_CMD_CHARGE_PUMP);
-    if (ret != ESP_OK) return ret;
-    ret = oled_write_command(0x14); // Enable charge pump
-    if (ret != ESP_OK) return ret;
-    
-    ret = oled_write_command(OLED_CMD_DEACTIVATE_SCROLL);
-    if (ret != ESP_OK) return ret;
-    
-    ret = oled_write_command(OLED_CMD_MEMORY_MODE);
-    if (ret != ESP_OK) return ret;
-    ret = oled_write_command(0x00); // Horizontal addressing mode
-    if (ret != ESP_OK) return ret;
-    
-    ret = oled_write_command(OLED_CMD_DISPLAY_ON);
-    if (ret != ESP_OK) return ret;
-    
-    ESP_LOGI(TAG, "OLED initialized successfully");
-    return ESP_OK;
+static void oled_clear(void) {
+    memset(oled_buffer, 0, sizeof(oled_buffer));
 }
 
-void oled_clear(void)
-{
-    memset(framebuffer, 0, sizeof(framebuffer));
-}
-
-void oled_set_pixel(int x, int y, bool on)
-{
-    if (x < 0 || x >= OLED_WIDTH || y < 0 || y >= OLED_HEIGHT) return;
-    
-    int byte_idx = x + (y / 8) * OLED_WIDTH;
-    int bit_idx = y % 8;
-    
-    if (on) {
-        framebuffer[byte_idx] |= (1 << bit_idx);
-    } else {
-        framebuffer[byte_idx] &= ~(1 << bit_idx);
+static void oled_set_pixel(int x, int y, bool on) {
+    if (x >= 0 && x < DISPLAY_WIDTH && y >= 0 && y < DISPLAY_HEIGHT) {
+        int page = y / 8;
+        int bit = y % 8;
+        int index = page * DISPLAY_WIDTH + x;
+        
+        if (on) {
+            oled_buffer[index] |= (1 << bit);
+        } else {
+            oled_buffer[index] &= ~(1 << bit);
+        }
     }
 }
 
-void oled_draw_char(int x, int y, char c)
-{
-    if (c < 32 || c > 122) c = ' ';
+static void oled_draw_char(int x, int y, char c) {
+    if (c < 32 || c > 95) c = 32; // Map to space if out of range
+    
     const uint8_t *glyph = font_5x7[c - 32];
     
     for (int col = 0; col < 5; col++) {
@@ -267,126 +237,914 @@ void oled_draw_char(int x, int y, char c)
     }
 }
 
-void oled_draw_string(int x, int y, const char *str)
-{
-    while (*str) {
-        oled_draw_char(x, y, *str);
-        x += 6; // 5 pixel width + 1 pixel spacing
+static void oled_draw_string(int x, int y, const char *str) {
+    int pos = x;
+    while (*str && pos < DISPLAY_WIDTH) {
+        oled_draw_char(pos, y, *str);
+        pos += 6; // 5 pixels + 1 spacing
         str++;
     }
 }
 
-void oled_draw_line(int x0, int y0, int x1, int y1, bool on)
-{
-    int dx = abs(x1 - x0);
-    int dy = abs(y1 - y0);
-    int sx = (x0 < x1) ? 1 : -1;
-    int sy = (y0 < y1) ? 1 : -1;
-    int err = dx - dy;
+static void oled_update(void) {
+    // Set column and page address with X offset for 72x40 visible area on 128x64 display
+    oled_write_command(0x21); // Column address
+    oled_write_command(OLED_X_OFFSET);
+    oled_write_command(OLED_X_OFFSET + DISPLAY_WIDTH - 1);
+    oled_write_command(0x22); // Page address
+    oled_write_command(0x00);
+    oled_write_command(OLED_PAGES - 1);
+    
+    // Send data
+    for (int page = 0; page < OLED_PAGES; page++) {
+        uint8_t data[DISPLAY_WIDTH + 1];
+        data[0] = 0x40; // Data mode
+        memcpy(&data[1], &oled_buffer[page * DISPLAY_WIDTH], DISPLAY_WIDTH);
+        i2c_master_transmit(oled_dev_handle, data, DISPLAY_WIDTH + 1, 1000);
+    }
+}
 
-    while (1) {
-        oled_set_pixel(x0, y0, on);
-        if (x0 == x1 && y0 == y1) break;
-        int e2 = 2 * err;
-        if (e2 > -dy) {
-            err -= dy;
-            x0 += sx;
+// ============================================================================
+// RTC Functions (DS3231)
+// ============================================================================
+
+#define DS3231_ADDR 0x68
+#define DS3231_REG_SEC    0x00
+#define DS3231_REG_MIN    0x01
+#define DS3231_REG_HOUR   0x02
+#define DS3231_REG_DAY    0x04
+#define DS3231_REG_MONTH  0x05
+#define DS3231_REG_YEAR   0x06
+
+static uint8_t bcd_to_dec(uint8_t val) {
+    return (val / 16 * 10) + (val % 16);
+}
+
+static uint8_t dec_to_bcd(uint8_t val) {
+    return (val / 10 * 16) + (val % 10);
+}
+
+static void rtc_write_reg(uint8_t reg, uint8_t val) {
+    uint8_t data[2] = {reg, val};
+    i2c_master_transmit(rtc_dev_handle, data, 2, 1000);
+}
+
+static uint8_t rtc_read_reg(uint8_t reg) {
+    uint8_t data = reg;
+    uint8_t val = 0;
+    
+    i2c_master_transmit(rtc_dev_handle, &data, 1, 1000);
+    i2c_master_receive(rtc_dev_handle, &val, 1, 1000);
+    
+    return val;
+}
+
+static void rtc_set_time(int year, int month, int day, int hour, int min, int sec) {
+    rtc_write_reg(DS3231_REG_SEC, dec_to_bcd(sec));
+    rtc_write_reg(DS3231_REG_MIN, dec_to_bcd(min));
+    rtc_write_reg(DS3231_REG_HOUR, dec_to_bcd(hour));
+    rtc_write_reg(DS3231_REG_DAY, dec_to_bcd(day));
+    rtc_write_reg(DS3231_REG_MONTH, dec_to_bcd(month));
+    rtc_write_reg(DS3231_REG_YEAR, dec_to_bcd(year - 2000));
+    
+    ESP_LOGI(TAG, "RTC set to %04d-%02d-%02d %02d:%02d:%02d", 
+             year, month, day, hour, min, sec);
+}
+
+static void rtc_get_time(int *year, int *month, int *day, int *hour, int *min, int *sec) {
+    *sec = bcd_to_dec(rtc_read_reg(DS3231_REG_SEC));
+    *min = bcd_to_dec(rtc_read_reg(DS3231_REG_MIN));
+    *hour = bcd_to_dec(rtc_read_reg(DS3231_REG_HOUR) & 0x3F);
+    *day = bcd_to_dec(rtc_read_reg(DS3231_REG_DAY));
+    *month = bcd_to_dec(rtc_read_reg(DS3231_REG_MONTH) & 0x1F);
+    *year = bcd_to_dec(rtc_read_reg(DS3231_REG_YEAR)) + 2000;
+}
+
+// ============================================================================
+// GPS NMEA Parsing
+// ============================================================================
+
+static float nmea_to_decimal(const char *coord, char dir) {
+    if (!coord || strlen(coord) == 0) return 0.0;
+    
+    // Parse DDMM.MMMM format
+    float value = atof(coord);
+    int degrees = (int)(value / 100);
+    float minutes = value - (degrees * 100);
+    float decimal = degrees + (minutes / 60.0);
+    
+    if (dir == 'S' || dir == 'W') {
+        decimal = -decimal;
+    }
+    
+    return decimal;
+}
+
+static void parse_gprmc(const char *sentence) {
+    // $GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*6A
+    char *tokens[15];
+    char buffer[256];
+    strncpy(buffer, sentence, sizeof(buffer) - 1);
+    
+    int count = 0;
+    char *ptr = strtok(buffer, ",");
+    while (ptr && count < 15) {
+        tokens[count++] = ptr;
+        ptr = strtok(NULL, ",");
+    }
+    
+    if (count < 10) return;
+    
+    // Check validity
+    if (tokens[2][0] == 'A') {
+        gps_data.fix_valid = true;
+        xEventGroupSetBits(s_event_group, GPS_FIX_BIT);
+        
+        // Parse time (hhmmss)
+        if (strlen(tokens[1]) >= 6) {
+            char tmp[3] = {0};
+            strncpy(tmp, tokens[1], 2); gps_data.hour = atoi(tmp);
+            strncpy(tmp, tokens[1] + 2, 2); gps_data.minute = atoi(tmp);
+            strncpy(tmp, tokens[1] + 4, 2); gps_data.second = atoi(tmp);
         }
-        if (e2 < dx) {
-            err += dx;
-            y0 += sy;
+        
+        // Parse date (ddmmyy)
+        if (strlen(tokens[9]) >= 6) {
+            char tmp[3] = {0};
+            strncpy(tmp, tokens[9], 2); gps_data.day = atoi(tmp);
+            strncpy(tmp, tokens[9] + 2, 2); gps_data.month = atoi(tmp);
+            strncpy(tmp, tokens[9] + 4, 2); gps_data.year = 2000 + atoi(tmp);
+        }
+        
+        // Parse position
+        gps_data.latitude = nmea_to_decimal(tokens[3], tokens[4][0]);
+        gps_data.longitude = nmea_to_decimal(tokens[5], tokens[6][0]);
+        gps_data.speed_knots = atof(tokens[7]);
+    } else {
+        gps_data.fix_valid = false;
+        xEventGroupClearBits(s_event_group, GPS_FIX_BIT);
+    }
+}
+
+static void parse_gpgga(const char *sentence) {
+    // $GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47
+    char *tokens[15];
+    char buffer[256];
+    strncpy(buffer, sentence, sizeof(buffer) - 1);
+    
+    int count = 0;
+    char *ptr = strtok(buffer, ",");
+    while (ptr && count < 15) {
+        tokens[count++] = ptr;
+        ptr = strtok(NULL, ",");
+    }
+    
+    if (count < 8) return;
+    
+    // Get satellite count
+    gps_data.satellites = atoi(tokens[7]);
+}
+
+static void parse_nmea_sentence(const char *sentence) {
+    if (strncmp(sentence, "$GPRMC", 6) == 0) {
+        parse_gprmc(sentence);
+    } else if (strncmp(sentence, "$GPGGA", 6) == 0) {
+        parse_gpgga(sentence);
+    }
+}
+
+// ============================================================================
+// WiFi Event Handler
+// ============================================================================
+
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,
+                               int32_t event_id, void* event_data) {
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+        ESP_LOGI(TAG, "WiFi connecting...");
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        xEventGroupClearBits(s_event_group, WIFI_CONNECTED_BIT);
+        esp_wifi_connect();
+        ESP_LOGI(TAG, "WiFi reconnecting...");
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAG, "WiFi connected, IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        xEventGroupSetBits(s_event_group, WIFI_CONNECTED_BIT);
+    }
+}
+
+static void wifi_init(void) {
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+    
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    
+    esp_event_handler_instance_t instance_any_id;
+    esp_event_handler_instance_t instance_got_ip;
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                        ESP_EVENT_ANY_ID,
+                                                        &wifi_event_handler,
+                                                        NULL,
+                                                        &instance_any_id));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
+                                                        IP_EVENT_STA_GOT_IP,
+                                                        &wifi_event_handler,
+                                                        NULL,
+                                                        &instance_got_ip));
+    
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = "",
+            .password = "",
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+        },
+    };
+    
+    // Copy WiFi credentials from config
+    strncpy((char*)wifi_config.sta.ssid, config_wifi_ssid, sizeof(wifi_config.sta.ssid) - 1);
+    strncpy((char*)wifi_config.sta.password, config_wifi_pass, sizeof(wifi_config.sta.password) - 1);
+    
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    
+    ESP_LOGI(TAG, "WiFi initialized");
+}
+
+// ============================================================================
+// NTP Time Sync Callback
+// ============================================================================
+
+static void time_sync_notification_cb(struct timeval *tv) {
+    ESP_LOGI(TAG, "NTP time synchronized");
+    xEventGroupSetBits(s_event_group, NTP_SYNCED_BIT);
+    
+    // Update RTC from NTP if NTP sync is selected
+    if (rtc_sync_source == RTC_SYNC_NTP) {
+        time_t now = tv->tv_sec;
+        struct tm timeinfo;
+        localtime_r(&now, &timeinfo);
+        
+        rtc_set_time(timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+                     timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+        xEventGroupSetBits(s_event_group, RTC_SYNCED_BIT);
+        ESP_LOGI(TAG, "RTC synced from NTP");
+    }
+}
+
+static void ntp_init(void) {
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, NTP_SERVER_PRIMARY);
+    esp_sntp_set_time_sync_notification_cb(time_sync_notification_cb);
+    esp_sntp_init();
+    
+    ESP_LOGI(TAG, "NTP initialized, server: %s", NTP_SERVER_PRIMARY);
+}
+
+// ============================================================================
+// MQTT Event Handler
+// ============================================================================
+
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base, 
+                               int32_t event_id, void *event_data) {
+    esp_mqtt_event_handle_t event = event_data;
+    
+    switch ((esp_mqtt_event_id_t)event_id) {
+    case MQTT_EVENT_CONNECTED:
+        ESP_LOGI(TAG, "MQTT connected");
+        break;
+    case MQTT_EVENT_DISCONNECTED:
+        ESP_LOGI(TAG, "MQTT disconnected");
+        break;
+    case MQTT_EVENT_ERROR:
+        ESP_LOGE(TAG, "MQTT error");
+        break;
+    default:
+        break;
+    }
+}
+
+// ============================================================================
+// Serial Menu Functions
+// ============================================================================
+
+static void serial_print_menu(void) {
+    printf("\n");
+    printf("╔════════════════════════════════════════════════╗\n");
+    printf("║        Localizer Configuration Menu            ║\n");
+    printf("║                                                ║\n");
+    printf("║  1. MQTT Broker Configuration                  ║\n");
+    printf("║  2. RTC Sync Source                            ║\n");
+    printf("║  3. GPS Debug Output                           ║\n");
+    printf("║  4. View Current Settings                      ║\n");
+    printf("║  5. Save Settings to NVS                       ║\n");
+    printf("║  6. Reboot Device                              ║\n");
+    printf("║                                                ║\n");
+    printf("║  Q. Quit Menu                                  ║\n");
+    printf("╚════════════════════════════════════════════════╝\n");
+    printf("Enter choice: ");
+}
+
+static void serial_configure_mqtt(void) {
+    char input[128];
+    
+    printf("\n=== MQTT Configuration ===\n");
+    printf("Current broker: %s\n", config_mqtt_broker);
+    printf("Enter new broker URI (or press Enter to keep): ");
+    fflush(stdout);
+    
+    if (fgets(input, sizeof(input), stdin) != NULL) {
+        // Remove newline
+        input[strcspn(input, "\n")] = 0;
+        if (strlen(input) > 0) {
+            strncpy(config_mqtt_broker, input, sizeof(config_mqtt_broker) - 1);
+            printf("Broker updated to: %s\n", config_mqtt_broker);
+        }
+    }
+    
+    printf("Current username: %s\n", config_mqtt_user);
+    printf("Enter new username (or press Enter to keep): ");
+    fflush(stdout);
+    
+    if (fgets(input, sizeof(input), stdin) != NULL) {
+        input[strcspn(input, "\n")] = 0;
+        if (strlen(input) > 0) {
+            strncpy(config_mqtt_user, input, sizeof(config_mqtt_user) - 1);
+            printf("Username updated to: %s\n", config_mqtt_user);
+        }
+    }
+    
+    printf("Current password: %s\n", config_mqtt_pass);
+    printf("Enter new password (or press Enter to keep): ");
+    fflush(stdout);
+    
+    if (fgets(input, sizeof(input), stdin) != NULL) {
+        input[strcspn(input, "\n")] = 0;
+        if (strlen(input) > 0) {
+            strncpy(config_mqtt_pass, input, sizeof(config_mqtt_pass) - 1);
+            printf("Password updated\n");
+        }
+    }
+    
+    printf("\nMQTT configuration updated (remember to save with option 5)\n");
+}
+
+static void serial_configure_rtc_sync(void) {
+    char input[10];
+    
+    printf("\n=== RTC Sync Source ===\n");
+    printf("Current source: %s\n", rtc_sync_source == RTC_SYNC_GPS ? "GPS" : "WiFi/NTP");
+    printf("1. GPS (default)\n");
+    printf("2. WiFi/NTP\n");
+    printf("Enter choice (1 or 2): ");
+    fflush(stdout);
+    
+    if (fgets(input, sizeof(input), stdin) != NULL) {
+        if (input[0] == '1') {
+            rtc_sync_source = RTC_SYNC_GPS;
+            printf("RTC sync source set to GPS\n");
+        } else if (input[0] == '2') {
+            rtc_sync_source = RTC_SYNC_NTP;
+            printf("RTC sync source set to WiFi/NTP\n");
+        } else {
+            printf("Invalid choice\n");
         }
     }
 }
 
-void oled_draw_rect(int x, int y, int w, int h, bool filled, bool on)
-{
-    if (filled) {
-        for (int i = 0; i < w; i++) {
-            for (int j = 0; j < h; j++) {
-                oled_set_pixel(x + i, y + j, on);
+static void serial_configure_gps_debug(void) {
+    char input[10];
+    
+    printf("\n=== GPS Debug Output ===\n");
+    printf("Current state: %s\n", gps_debug_enabled ? "ENABLED" : "DISABLED");
+    printf("1. Enable\n");
+    printf("2. Disable\n");
+    printf("Enter choice (1 or 2): ");
+    fflush(stdout);
+    
+    if (fgets(input, sizeof(input), stdin) != NULL) {
+        if (input[0] == '1') {
+            gps_debug_enabled = true;
+            printf("GPS debug output ENABLED\n");
+        } else if (input[0] == '2') {
+            gps_debug_enabled = false;
+            printf("GPS debug output DISABLED\n");
+        } else {
+            printf("Invalid choice\n");
+        }
+    }
+}
+
+static void serial_view_settings(void) {
+    printf("\n=== Current Settings ===\n");
+    printf("MQTT Broker:    %s\n", config_mqtt_broker);
+    printf("MQTT Username:  %s\n", config_mqtt_user);
+    printf("MQTT Password:  %s\n", config_mqtt_pass);
+    printf("RTC Sync:       %s\n", rtc_sync_source == RTC_SYNC_GPS ? "GPS" : "WiFi/NTP");
+    printf("GPS Debug:      %s\n", gps_debug_enabled ? "ENABLED" : "DISABLED");
+    printf("\nGPS Status:\n");
+    printf("  Fix:          %s\n", gps_data.fix_valid ? "VALID" : "NO FIX");
+    printf("  Satellites:   %d\n", gps_data.satellites);
+    printf("  Latitude:     %.6f\n", gps_data.latitude);
+    printf("  Longitude:    %.6f\n", gps_data.longitude);
+    printf("  Time:         %02d:%02d:%02d\n", gps_data.hour, gps_data.minute, gps_data.second);
+    printf("\nLocation:\n");
+    printf("  Street:       %s\n", location_street);
+    printf("  City:         %s\n", location_city);
+    printf("  Country:      %s\n", location_country);
+}
+
+static void serial_save_settings(void) {
+    printf("\nSaving settings to NVS...\n");
+    
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open("config", NVS_READWRITE, &nvs_handle);
+    if (err != ESP_OK) {
+        printf("Error opening NVS: %s\n", esp_err_to_name(err));
+        return;
+    }
+    
+    nvs_set_str(nvs_handle, "mqtt_broker", config_mqtt_broker);
+    nvs_set_str(nvs_handle, "mqtt_user", config_mqtt_user);
+    nvs_set_str(nvs_handle, "mqtt_pass", config_mqtt_pass);
+    nvs_set_u8(nvs_handle, "rtc_sync_src", (uint8_t)rtc_sync_source);
+    nvs_set_u8(nvs_handle, "gps_debug", (uint8_t)gps_debug_enabled);
+    
+    err = nvs_commit(nvs_handle);
+    if (err == ESP_OK) {
+        printf("Settings saved successfully!\n");
+    } else {
+        printf("Error saving settings: %s\n", esp_err_to_name(err));
+    }
+    
+    nvs_close(nvs_handle);
+}
+
+static void serial_load_settings(void) {
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open("config", NVS_READONLY, &nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGI(TAG, "No saved config, using defaults");
+        return;
+    }
+    
+    size_t len;
+    
+    // Load WiFi credentials
+    len = sizeof(config_wifi_ssid);
+    nvs_get_str(nvs_handle, "wifi_ssid", config_wifi_ssid, &len);
+    
+    len = sizeof(config_wifi_pass);
+    nvs_get_str(nvs_handle, "wifi_pass", config_wifi_pass, &len);
+    
+    // Load MQTT settings
+    len = sizeof(config_mqtt_broker);
+    nvs_get_str(nvs_handle, "mqtt_broker", config_mqtt_broker, &len);
+    
+    // Validate MQTT broker - if it contains non-printable or GPS data, reset to default
+    bool invalid = false;
+    for (int i = 0; i < strlen(config_mqtt_broker); i++) {
+        if (config_mqtt_broker[i] == '$' || config_mqtt_broker[i] == '*' || config_mqtt_broker[i] < 32) {
+            invalid = true;
+            break;
+        }
+    }
+    if (invalid) {
+        strcpy(config_mqtt_broker, MQTT_BROKER_URI);
+        ESP_LOGI(TAG, "Corrupted MQTT broker detected, reset to default");
+    }
+    
+    len = sizeof(config_mqtt_user);
+    nvs_get_str(nvs_handle, "mqtt_user", config_mqtt_user, &len);
+    
+    len = sizeof(config_mqtt_pass);
+    nvs_get_str(nvs_handle, "mqtt_pass", config_mqtt_pass, &len);
+    
+    uint8_t temp;
+    if (nvs_get_u8(nvs_handle, "rtc_sync_src", &temp) == ESP_OK) {
+        rtc_sync_source = (rtc_sync_source_t)temp;
+    }
+    
+    if (nvs_get_u8(nvs_handle, "gps_debug", &temp) == ESP_OK) {
+        gps_debug_enabled = (bool)temp;
+    }
+    
+    nvs_close(nvs_handle);
+    ESP_LOGI(TAG, "Settings loaded from NVS");
+}
+
+static void serial_menu_task(void *pvParameters) {
+    bool in_menu = false;
+    uint8_t data;
+    
+    printf("\n[Localizer GPS Tracker - Ready]\n");
+    printf("[Press ` (backtick) for menu]\n\n");
+    
+    while (1) {
+        // Read from UART0 (console) with timeout
+        int len = uart_read_bytes(UART_NUM_0, &data, 1, pdMS_TO_TICKS(100));
+        
+        if (len <= 0) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+        
+        int c = (int)data;
+        
+        // Ignore invalid characters
+        if (c == 0 || c == 0xFF) {
+            continue;
+        }
+        
+        // Check for backtick key to enter menu
+        if (!in_menu && c == '`') {
+            in_menu = true;
+            serial_print_menu();
+            continue;
+        }
+        
+        // Process menu commands only when in menu
+        if (in_menu) {
+            switch (c) {
+                case '1':
+                    serial_configure_mqtt();
+                    serial_print_menu();
+                    break;
+                case '2':
+                    serial_configure_rtc_sync();
+                    serial_print_menu();
+                    break;
+                case '3':
+                    serial_configure_gps_debug();
+                    serial_print_menu();
+                    break;
+                case '4':
+                    serial_view_settings();
+                    serial_print_menu();
+                    break;
+                case '5':
+                    serial_save_settings();
+                    serial_print_menu();
+                    break;
+                case '6':
+                    printf("\nRebooting...\n");
+                    vTaskDelay(pdMS_TO_TICKS(1000));
+                    esp_restart();
+                    break;
+                case 'q':
+                case 'Q':
+                case 'x':
+                case 'X':
+                    printf("\nExiting menu...\n\n");
+                    in_menu = false;
+                    break;
             }
         }
-    } else {
-        oled_draw_line(x, y, x + w - 1, y, on);
-        oled_draw_line(x + w - 1, y, x + w - 1, y + h - 1, on);
-        oled_draw_line(x + w - 1, y + h - 1, x, y + h - 1, on);
-        oled_draw_line(x, y + h - 1, x, y, on);
+        
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
-void oled_draw_circle(int cx, int cy, int radius, bool on)
-{
-    int x = radius;
-    int y = 0;
-    int err = 0;
+static void mqtt_init(void) {
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .broker.address.uri = config_mqtt_broker,
+        .credentials.username = config_mqtt_user,
+        .credentials.authentication.password = config_mqtt_pass,
+    };
+    
+    mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+    esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    esp_mqtt_client_start(mqtt_client);
+    
+    ESP_LOGI(TAG, "MQTT client started");
+}
 
-    while (x >= y) {
-        oled_set_pixel(cx + x, cy + y, on);
-        oled_set_pixel(cx + y, cy + x, on);
-        oled_set_pixel(cx - y, cy + x, on);
-        oled_set_pixel(cx - x, cy + y, on);
-        oled_set_pixel(cx - x, cy - y, on);
-        oled_set_pixel(cx - y, cy - x, on);
-        oled_set_pixel(cx + y, cy - x, on);
-        oled_set_pixel(cx + x, cy - y, on);
+static void mqtt_publish_gps(void) {
+    if (!mqtt_client) return;
+    
+    char topic[128];
+    char payload[256];
+    
+    snprintf(topic, sizeof(topic), "camper/device01/gps");
+    snprintf(payload, sizeof(payload), 
+             "{\"lat\":%.6f,\"lon\":%.6f,\"sats\":%d,\"speed\":%.1f,\"fix\":%s}",
+             gps_data.latitude, gps_data.longitude, gps_data.satellites,
+             gps_data.speed_knots, gps_data.fix_valid ? "true" : "false");
+    
+    esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 1, 0);
+}
 
-        if (err <= 0) {
-            y += 1;
-            err += 2 * y + 1;
+static void mqtt_publish_location(void) {
+    if (!mqtt_client) return;
+    
+    char topic[128];
+    char payload[256];
+    
+    snprintf(topic, sizeof(topic), "camper/device01/location");
+    snprintf(payload, sizeof(payload), 
+             "{\"street\": \"%s\",\"city\":\"%s\",\"country\":\"%s\"}",
+             location_street, location_city, location_country);
+    
+    esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 1, 0);
+}
+
+// ============================================================================
+// HTTP Geolocation Lookup
+// ============================================================================
+
+static char http_response_buffer[4096];
+static int http_response_len = 0;
+
+static esp_err_t http_event_handler(esp_http_client_event_t *evt) {
+    switch(evt->event_id) {
+    case HTTP_EVENT_ON_DATA:
+        if (http_response_len + evt->data_len < sizeof(http_response_buffer)) {
+            memcpy(http_response_buffer + http_response_len, evt->data, evt->data_len);
+            http_response_len += evt->data_len;
+            http_response_buffer[http_response_len] = 0;
         }
-        if (err > 0) {
-            x -= 1;
-            err -= 2 * x + 1;
-        }
+        break;
+    default:
+        break;
     }
-}
-
-void oled_invert(void)
-{
-    for (int i = 0; i < sizeof(framebuffer); i++) {
-        framebuffer[i] = ~framebuffer[i];
-    }
-}
-
-esp_err_t oled_update(void)
-{
-    esp_err_t ret;
-    
-    // Set column address (0 to 127)
-    ret = oled_write_command(OLED_CMD_COLUMN_ADDR);
-    if (ret != ESP_OK) return ret;
-    ret = oled_write_command(0x00);
-    if (ret != ESP_OK) return ret;
-    ret = oled_write_command(0x7F); // 127
-    if (ret != ESP_OK) return ret;
-    
-    // Set page address (0 to 7)
-    ret = oled_write_command(OLED_CMD_PAGE_ADDR);
-    if (ret != ESP_OK) return ret;
-    ret = oled_write_command(0x00);
-    if (ret != ESP_OK) return ret;
-    ret = oled_write_command(0x07); // 7 pages (64/8)
-    if (ret != ESP_OK) return ret;
-    
-    // Send framebuffer in chunks
-    const size_t chunk_size = 128;
-    for (size_t i = 0; i < sizeof(framebuffer); i += chunk_size) {
-        size_t len = (i + chunk_size > sizeof(framebuffer)) ? (sizeof(framebuffer) - i) : chunk_size;
-        ret = oled_write_data(&framebuffer[i], len);
-        if (ret != ESP_OK) return ret;
-    }
-    
     return ESP_OK;
 }
 
-void app_main(void)
-{
-    ESP_LOGI(TAG, "OLED Display Test - Syquens B.V.");
-    ESP_LOGI(TAG, "Initializing I2C bus on GPIO5 (SDA) and GPIO6 (SCL)...");
+static void lookup_location(void) {
+    if (!gps_data.fix_valid) return;
     
-    // Configure I2C master bus
-    i2c_master_bus_config_t bus_config = {
+    char url[256];
+    snprintf(url, sizeof(url), 
+             "https://nominatim.openstreetmap.org/reverse?format=json&lat=%.6f&lon=%.6f",
+             gps_data.latitude, gps_data.longitude);
+    
+    http_response_len = 0;
+    memset(http_response_buffer, 0, sizeof(http_response_buffer));
+    
+    esp_http_client_config_t config = {
+        .url = url,
+        .event_handler = http_event_handler,
+        .timeout_ms = 5000,
+        .user_agent = "Localizer/1.0",
+    };
+    
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_err_t err = esp_http_client_perform(client);
+    
+    if (err == ESP_OK) {
+        cJSON *root = cJSON_Parse(http_response_buffer);
+        if (root) {
+            cJSON *address = cJSON_GetObjectItem(root, "address");
+            if (address) {
+                cJSON *road = cJSON_GetObjectItem(address, "road");
+                cJSON *city = cJSON_GetObjectItem(address, "city");
+                cJSON *town = cJSON_GetObjectItem(address, "town");
+                cJSON *village = cJSON_GetObjectItem(address, "village");
+                cJSON *country_code = cJSON_GetObjectItem(address, "country_code");
+                
+                if (road && road->valuestring) {
+                    strncpy(location_street, road->valuestring, sizeof(location_street) - 1);
+                }
+                
+                if (city && city->valuestring) {
+                    strncpy(location_city, city->valuestring, sizeof(location_city) - 1);
+                } else if (town && town->valuestring) {
+                    strncpy(location_city, town->valuestring, sizeof(location_city) - 1);
+                } else if (village && village->valuestring) {
+                    strncpy(location_city, village->valuestring, sizeof(location_city) - 1);
+                }
+                
+                if (country_code && country_code->valuestring) {
+                    strncpy(location_country, country_code->valuestring, sizeof(location_country) - 1);
+                }
+                
+                ESP_LOGI(TAG, "Location: %s, %s, %s", 
+                        location_street, location_city, location_country);
+            }
+            cJSON_Delete(root);
+        }
+    } else {
+        ESP_LOGE(TAG, "HTTP request failed: %s", esp_err_to_name(err));
+    }
+    
+    esp_http_client_cleanup(client);
+}
+
+// ============================================================================
+// GPS UART Task
+// ============================================================================
+
+static void gps_task(void *pvParameters) {
+    uart_config_t uart_config = {
+        .baud_rate = GPS_BAUD_RATE,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+    };
+    
+    uart_driver_install(GPS_UART_NUM, GPS_BUFFER_SIZE, 0, 0, NULL, 0);
+    uart_param_config(GPS_UART_NUM, &uart_config);
+    uart_set_pin(GPS_UART_NUM, GPS_TX_PIN, GPS_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    
+    ESP_LOGI(TAG, "GPS UART initialized on UART%d (TX:%d RX:%d)", GPS_UART_NUM, GPS_TX_PIN, GPS_RX_PIN);
+    
+    char line_buffer[256];
+    int line_pos = 0;
+    bool gps_time_synced = false;
+    
+    while (1) {
+        uint8_t data;
+        int len = uart_read_bytes(GPS_UART_NUM, &data, 1, 100 / portTICK_PERIOD_MS);
+        
+        if (len > 0) {
+            if (data == '\n') {
+                line_buffer[line_pos] = 0;
+                if (line_pos > 0 && line_buffer[0] == '$') {
+                    parse_nmea_sentence(line_buffer);
+                    
+                    // Debug output if enabled
+                    if (gps_debug_enabled && gps_data.fix_valid) {
+                        printf("[GPS] Lat: %.6f, Lon: %.6f, Sats: %d, Time: %02d:%02d:%02d, Speed: %.1f kts\n",
+                               gps_data.latitude, gps_data.longitude, gps_data.satellites,
+                               gps_data.hour, gps_data.minute, gps_data.second, gps_data.speed_knots);
+                        printf("[LOC] Street: %s, City: %s, Country: %s\n",
+                               location_street, location_city, location_country);
+                    }
+                    
+                    // Sync RTC from GPS when first fix is acquired (if GPS sync is selected)
+                    if (gps_data.fix_valid && !gps_time_synced && rtc_sync_source == RTC_SYNC_GPS) {
+                        rtc_set_time(gps_data.year, gps_data.month, gps_data.day,
+                                   gps_data.hour, gps_data.minute, gps_data.second);
+                        xEventGroupSetBits(s_event_group, RTC_SYNCED_BIT);
+                        gps_time_synced = true;
+                        ESP_LOGI(TAG, "RTC synced from GPS");
+                    }
+                }
+                line_pos = 0;
+            } else if (line_pos < sizeof(line_buffer) - 1) {
+                line_buffer[line_pos++] = data;
+            }
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+// ============================================================================
+// Location Lookup Task
+// ============================================================================
+
+static void location_task(void *pvParameters) {
+    while (1) {
+        EventBits_t bits = xEventGroupWaitBits(s_event_group, 
+                                               WIFI_CONNECTED_BIT | GPS_FIX_BIT,
+                                               pdFALSE, pdTRUE, portMAX_DELAY);
+        
+        if ((bits & (WIFI_CONNECTED_BIT | GPS_FIX_BIT)) == 
+            (WIFI_CONNECTED_BIT | GPS_FIX_BIT)) {
+            lookup_location();
+            mqtt_publish_location();
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(5000)); // Every 5 seconds
+    }
+}
+
+// ============================================================================
+// MQTT Publish Task
+// ============================================================================
+
+static void mqtt_publish_task(void *pvParameters) {
+    while (1) {
+        EventBits_t bits = xEventGroupWaitBits(s_event_group, 
+                                               WIFI_CONNECTED_BIT,
+                                               pdFALSE, pdFALSE, portMAX_DELAY);
+        
+        if (bits & WIFI_CONNECTED_BIT) {
+            if (gps_data.fix_valid) {
+                mqtt_publish_gps();
+            }
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(2000)); // Every 2 seconds
+    }
+}
+
+// ============================================================================
+// Display Update Task
+// ============================================================================
+
+static void display_task(void *pvParameters) {
+    TickType_t last_wake_time = xTaskGetTickCount();
+    
+    while (1) {
+        oled_clear();
+        
+        EventBits_t bits = xEventGroupGetBits(s_event_group);
+        
+        // Line 1: GPS status
+        if (bits & GPS_FIX_BIT) {
+            oled_draw_string(0, 0, "GPS FIX OK");
+        } else {
+            oled_draw_string(0, 0, "GPS: INIT");
+        }
+        
+        // Line 2: RTC status
+        if (bits & RTC_SYNCED_BIT) {
+            oled_draw_string(0, 8, "RTC SYNC");
+        } else {
+            oled_draw_string(0, 8, "RTC LOCAL");
+        }
+        
+        // Line 3: WiFi and NTP status (centered separator)
+        if (bits & WIFI_CONNECTED_BIT) {
+            oled_draw_string(0, 16, "WIFI");
+        } else {
+            oled_draw_string(0, 16, "----");
+        }
+        
+        oled_draw_string(30, 16, "---");  // Centered separator
+        
+        if (bits & NTP_SYNCED_BIT) {
+            oled_draw_string(48, 16, "NTP");
+        } else {
+            oled_draw_string(48, 16, "---");
+        }
+        
+        // Line 4: Scrolling GPS data
+        char line4[128];
+        snprintf(line4, sizeof(line4), 
+                "%.6f %.6f %02d:%02d:%02d SAT:%d  ",
+                gps_data.latitude, gps_data.longitude,
+                gps_data.hour, gps_data.minute, gps_data.second,
+                gps_data.satellites);
+        
+        int line4_len = strlen(line4) * 6; // 6 pixels per char
+        if (line4_len > DISPLAY_WIDTH) {
+            int offset = scroll_pos_line4 % line4_len;
+            // Draw scrolling text
+            for (int i = 0; i < strlen(line4); i++) {
+                int x = i * 6 - offset;
+                if (x >= -6 && x < DISPLAY_WIDTH) {
+                    oled_draw_char(x, 24, line4[i]);
+                }
+            }
+            scroll_pos_line4 = (scroll_pos_line4 + 2) % line4_len;
+        } else {
+            oled_draw_string(0, 24, line4);
+        }
+        
+        // Line 5: Scrolling location
+        char line5[256];
+        snprintf(line5, sizeof(line5), "%s %s %s  ",
+                location_street, location_city, location_country);
+        
+        int line5_len = strlen(line5) * 6;
+        if (line5_len > DISPLAY_WIDTH) {
+            int offset = scroll_pos_line5 % line5_len;
+            for (int i = 0; i < strlen(line5); i++) {
+                int x = i * 6 - offset;
+                if (x >= -6 && x < DISPLAY_WIDTH) {
+                    oled_draw_char(x, 32, line5[i]);
+                }
+            }
+            scroll_pos_line5 = (scroll_pos_line5 + 2) % line5_len;
+        } else {
+            oled_draw_string(0, 32, line5);
+        }
+        
+        oled_update();
+        
+        vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(100)); // 10 Hz refresh
+    }
+}
+
+// ============================================================================
+// Main Application
+// ============================================================================
+
+void app_main(void) {
+    ESP_LOGI(TAG, "Localizer starting...");
+    
+    // Initialize NVS
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+    
+    // Load settings from NVS
+    serial_load_settings();
+    
+    // Create event group
+    s_event_group = xEventGroupCreate();
+    
+    // Initialize I2C bus
+    i2c_master_bus_config_t i2c_bus_config = {
         .clk_source = I2C_CLK_SRC_DEFAULT,
         .i2c_port = I2C_NUM_0,
         .scl_io_num = I2C_MASTER_SCL_IO,
@@ -394,137 +1152,52 @@ void app_main(void)
         .glitch_ignore_cnt = 7,
         .flags.enable_internal_pullup = true,
     };
-    
-    ESP_ERROR_CHECK(i2c_new_master_bus(&bus_config, &i2c_bus_handle));
+    ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_config, &i2c_bus_handle));
     ESP_LOGI(TAG, "I2C bus initialized");
     
-    // Add OLED device to bus
-    i2c_device_config_t oled_config = {
+    // Initialize OLED device
+    i2c_device_config_t oled_dev_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = OLED_I2C_ADDR,
-        .scl_speed_hz = I2C_MASTER_FREQ_HZ,
+        .scl_speed_hz = 400000,
     };
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(i2c_bus_handle, &oled_dev_cfg, &oled_dev_handle));
     
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(i2c_bus_handle, &oled_config, &oled_dev_handle));
-    ESP_LOGI(TAG, "OLED device added to I2C bus at address 0x%02X", OLED_I2C_ADDR);
+    // Initialize RTC device
+    i2c_device_config_t rtc_dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = DS3231_ADDR,
+        .scl_speed_hz = 400000,
+    };
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(i2c_bus_handle, &rtc_dev_cfg, &rtc_dev_handle));
     
-    // Initialize OLED
-    vTaskDelay(pdMS_TO_TICKS(100)); // Wait for OLED to power up
-    ESP_ERROR_CHECK(oled_init());
-    
-    // Clear display
+    // Initialize OLED display
+    oled_init();
     oled_clear();
-    ESP_ERROR_CHECK(oled_update());
-    ESP_LOGI(TAG, "Display cleared");
+    oled_draw_string(0, 0, "Localizer");
+    oled_draw_string(0, 8, "Starting...");
+    oled_update();
     
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    // Initialize WiFi
+    wifi_init();
     
-    // ==== DEMO 1: Text Capacity Test ====
-    ESP_LOGI(TAG, "Demo 1: Maximum text capacity (72x40 pixels, 5x7 font)");
-    oled_clear();
+    // Wait for WiFi connection
+    xEventGroupWaitBits(s_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE, 
+                       pdMS_TO_TICKS(10000));
     
-    // Show text capacity: 12 chars wide x 5 lines
-    int x = OLED_X_OFFSET;
-    int y = OLED_Y_OFFSET;
+    // Initialize NTP
+    ntp_init();
     
-    oled_draw_string(x, y, "Line 1: 12ch");
-    oled_draw_string(x, y + 8, "Line 2: Data");
-    oled_draw_string(x, y + 16, "Line 3: More");
-    oled_draw_string(x, y + 24, "Line 4: Text");
-    oled_draw_string(x, y + 32, "Line 5: End!");
+    // Initialize MQTT
+    mqtt_init();
     
-    ESP_ERROR_CHECK(oled_update());
-    ESP_LOGI(TAG, "Showing 5 lines x 12 characters = 60 chars max");
-    vTaskDelay(pdMS_TO_TICKS(3000));
+    // Create tasks
+    xTaskCreate(gps_task, "gps_task", 4096, NULL, 5, NULL);
+    xTaskCreate(display_task, "display_task", 4096, NULL, 4, NULL);
+    xTaskCreate(location_task, "location_task", 8192, NULL, 3, NULL);
+    xTaskCreate(mqtt_publish_task, "mqtt_task", 4096, NULL, 3, NULL);
+    // Serial menu permanently disabled - GPS shares UART0 with console on ESP32-C3
+    // xTaskCreate(serial_menu_task, "serial_menu", 4096, NULL, 2, NULL);
     
-    // ==== DEMO 2: Graphics Test ====
-    ESP_LOGI(TAG, "Demo 2: Graphics - lines, rectangles, circles");
-    oled_clear();
-    
-    // Draw border around visible area
-    oled_draw_rect(OLED_X_OFFSET, OLED_Y_OFFSET, OLED_VISIBLE_WIDTH, OLED_VISIBLE_HEIGHT, false, true);
-    
-    // Draw diagonal lines
-    oled_draw_line(OLED_X_OFFSET + 5, OLED_Y_OFFSET + 5, OLED_X_OFFSET + 25, OLED_Y_OFFSET + 25, true);
-    oled_draw_line(OLED_X_OFFSET + 25, OLED_Y_OFFSET + 5, OLED_X_OFFSET + 5, OLED_Y_OFFSET + 25, true);
-    
-    // Draw circles
-    oled_draw_circle(OLED_X_OFFSET + 50, OLED_Y_OFFSET + 15, 8, true);
-    oled_draw_circle(OLED_X_OFFSET + 50, OLED_Y_OFFSET + 15, 5, true);
-    
-    // Draw filled rectangles
-    oled_draw_rect(OLED_X_OFFSET + 30, OLED_Y_OFFSET + 28, 10, 8, true, true);
-    
-    ESP_ERROR_CHECK(oled_update());
-    ESP_LOGI(TAG, "Graphics displayed");
-    vTaskDelay(pdMS_TO_TICKS(3000));
-    
-    // ==== DEMO 3: Patterns and Inversion ====
-    ESP_LOGI(TAG, "Demo 3: Patterns and screen inversion");
-    oled_clear();
-    
-    // Checkerboard pattern
-    for (int i = OLED_X_OFFSET; i < OLED_X_OFFSET + OLED_VISIBLE_WIDTH; i += 4) {
-        for (int j = OLED_Y_OFFSET; j < OLED_Y_OFFSET + OLED_VISIBLE_HEIGHT; j += 4) {
-            oled_draw_rect(i, j, 2, 2, true, true);
-        }
-    }
-    ESP_ERROR_CHECK(oled_update());
-    vTaskDelay(pdMS_TO_TICKS(1500));
-    
-    // Invert display
-    oled_invert();
-    ESP_ERROR_CHECK(oled_update());
-    vTaskDelay(pdMS_TO_TICKS(1500));
-    
-    // ==== DEMO 4: Dual Scrolling Lines ====
-    ESP_LOGI(TAG, "Demo 4: Dual scrolling text animation");
-    
-    const char *scroll_text1 = "Syquens B.V. - ESP32-C3 OLED Display     ";
-    const char *scroll_text2 = "0.42 inch - 72x40 pixels - SSD1306     ";
-    int scroll_len1 = strlen(scroll_text1);
-    int scroll_len2 = strlen(scroll_text2);
-    int scroll_width1 = scroll_len1 * 6;
-    int scroll_width2 = scroll_len2 * 6;
-    
-    // Scroll for 10 seconds
-    for (int offset = 0; offset < scroll_width1; offset += 2) {
-        oled_clear();
-        
-        // Top scrolling line (left to right)
-        int x1 = OLED_X_OFFSET + OLED_VISIBLE_WIDTH - offset;
-        if (x1 < OLED_X_OFFSET) x1 += scroll_width1;
-        oled_draw_string(x1, OLED_Y_OFFSET + 8, scroll_text1);
-        
-        // Bottom scrolling line (right to left)
-        int x2 = OLED_X_OFFSET - (offset % scroll_width2);
-        oled_draw_string(x2, OLED_Y_OFFSET + 24, scroll_text2);
-        
-        ESP_ERROR_CHECK(oled_update());
-        vTaskDelay(pdMS_TO_TICKS(30));
-    }
-    
-    // ==== DEMO 5: Final Screen - Company Logo Style ====
-    ESP_LOGI(TAG, "Demo 5: Final display - Syquens B.V.");
-    oled_clear();
-    
-    // Draw decorative border
-    oled_draw_rect(OLED_X_OFFSET + 2, OLED_Y_OFFSET + 2, OLED_VISIBLE_WIDTH - 4, OLED_VISIBLE_HEIGHT - 4, false, true);
-    oled_draw_rect(OLED_X_OFFSET + 4, OLED_Y_OFFSET + 4, OLED_VISIBLE_WIDTH - 8, OLED_VISIBLE_HEIGHT - 8, false, true);
-    
-    // Center text
-    const char *company = "Syquens B.V.";
-    int text_width = strlen(company) * 6;
-    x = OLED_X_OFFSET + (OLED_VISIBLE_WIDTH - text_width) / 2;
-    y = OLED_Y_OFFSET + (OLED_VISIBLE_HEIGHT - 7) / 2;
-    
-    oled_draw_string(x, y, company);
-    
-    ESP_ERROR_CHECK(oled_update());
-    ESP_LOGI(TAG, "Demo complete! Display shows final screen.");
-    ESP_LOGI(TAG, "Screen specs: 72x40 pixels, ~12 chars/line, 5 lines max");
-    
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
+    ESP_LOGI(TAG, "Localizer running");
 }
